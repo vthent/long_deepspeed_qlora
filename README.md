@@ -6,7 +6,7 @@
 requirements.txt 是我日常的开发环境，里面的安装包比较多。flash_attn要根据具体的环境进行安装。
 技术原理：Paper: https://www.arxiv.org/abs/2407.15892
 
-这个框架修改了很多默认的运算，需要配合专门的显示及训练参数
+这个框架修改了很多默认的运算，需要配合以下的类工作：
 EnhancedLossLoggingCallback 用来记录损失函数，
 ClipAuditCallback 用来记录梯度
 MST_Trainer用来配合MiniSequence进行训练。
