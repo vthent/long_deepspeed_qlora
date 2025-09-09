@@ -18,6 +18,7 @@ import transformers
 from transformers import logging
 logger = logging.get_logger(__name__)
 
+
 class MLPWrapper(nn.Module):
     """Universal MLP wrapper for both Llama and Qwen3 models"""
     def __init__(
@@ -58,7 +59,6 @@ class MLPWrapper(nn.Module):
 
     def state_dict(self, destination=None, prefix='', keep_vars=False):
         return self.module.state_dict(destination, prefix, keep_vars)
-
 class _LMHeadFunction(torch.autograd.Function):
     """
     Stable backward for LM head: correct masking + return grads instead of mutating weight.grad
@@ -109,6 +109,7 @@ class _LMHeadFunction(torch.autograd.Function):
 
         # labels has no gradient
         return grad_hidden, None, grad_weight
+
 
 class LMHeadWrapper(nn.Module):
     """Wrapper for LM head with custom gradient computation"""
