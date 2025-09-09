@@ -1,5 +1,3 @@
-#能够正常工作，就是loss function的计算有问题，偏大；40左右；正在查找原因
-#在v0的版本上修改
 import math
 import warnings
 from typing import List, Optional, Tuple, Union, Dict, Any
@@ -19,7 +17,6 @@ from transformers.modeling_outputs import (
 import transformers
 from transformers import logging
 logger = logging.get_logger(__name__)
-
 
 class MLPWrapper(nn.Module):
     """Universal MLP wrapper for both Llama and Qwen3 models"""
@@ -61,165 +58,6 @@ class MLPWrapper(nn.Module):
 
     def state_dict(self, destination=None, prefix='', keep_vars=False):
         return self.module.state_dict(destination, prefix, keep_vars)
-
-#v0
-'''
-class _LMHeadFunction(torch.autograd.Function):
-    """
-    Custom autograd function for LM head with a corrected and stable
-    backward pass for accurate gradient computation.
-    """
-    @staticmethod
-    def forward(ctx, hidden_states, labels, weight):
-        # Flatten inputs for cross_entropy which expects 2D logits and 1D labels
-        logits_flat = F.linear(hidden_states.view(-1, hidden_states.size(-1)), weight).float()
-        labels_flat = labels.view(-1)
-        
-        # Calculate loss using the built-in, optimized CrossEntropyLoss
-        loss = F.cross_entropy(logits_flat, labels_flat, reduction="sum", ignore_index=-100)
-        
-        # Increment usage counter for tracking mini-sequences
-        if hasattr(weight, 'count'):
-            weight.count += 1
-        else:
-            weight.count = 1
-        
-        # Save necessary tensors for the backward pass
-        ctx.save_for_backward(hidden_states, labels, weight)
-        
-        return loss
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        hidden_states, labels, weight = ctx.saved_tensors
-        
-        if hasattr(weight, 'count'):
-            weight.count -= 1
-
-        # Reshape for calculation
-        hidden_states_flat = hidden_states.view(-1, hidden_states.size(-1))
-        labels_flat = labels.view(-1)
-        
-        # Recompute logits to save memory (activation recomputation)
-        logits_flat = F.linear(hidden_states_flat, weight).float()
-        
-        # CORRECT GRADIENT CALCULATION:
-        # 1. Compute softmax probabilities
-        grad_logits = F.softmax(logits_flat, dim=-1)
-        
-        # 2. Use scatter_ to subtract 1 at the location of the correct labels (p - y)
-        # This is a robust way to handle the one-hot subtraction
-        ignore_index = -100
-        valid_labels_mask = labels_flat != ignore_index
-        
-        if valid_labels_mask.any():
-             # Get the indices of the valid labels
-            valid_indices = labels_flat[valid_labels_mask].unsqueeze(1)
-            # Create a tensor of -1s to subtract
-            subtraction_tensor = torch.full_like(valid_indices, -1, dtype=grad_logits.dtype)
-            # Apply subtraction only to the rows with valid labels
-            grad_logits[valid_labels_mask] = grad_logits[valid_labels_mask].scatter_add(1, valid_indices, subtraction_tensor)
-        
-        # Scale by the incoming gradient
-        grad_logits *= grad_output
-        grad_logits = grad_logits.to(hidden_states.dtype)
-
-        # Gradient for hidden_states
-        grad_hidden_states = (grad_logits @ weight).view_as(hidden_states)
-        
-        # Gradient for weights (accumulated)
-        grad_weight_chunk = grad_logits.T @ hidden_states_flat
-        if not hasattr(weight, 'grad') or weight.grad is None:
-            weight.grad = grad_weight_chunk
-        else:
-            weight.grad.add_(grad_weight_chunk)
-
-        # Only return the final accumulated weight gradient on the last chunk
-        if hasattr(weight, 'count') and weight.count == 0:
-            return grad_hidden_states, None, weight.grad
-        else:
-            return grad_hidden_states, None, None
-'''
-
-#v1
-'''
-class _LMHeadFunction(torch.autograd.Function):
-    """
-    Custom autograd function for LM head with corrected gradient computation.
-    """
-    @staticmethod
-    def forward(ctx, hidden_states, labels, weight):
-        # Flatten inputs for cross_entropy
-        logits_flat = F.linear(hidden_states.view(-1, hidden_states.size(-1)), weight).float()
-        labels_flat = labels.view(-1)
-        
-        # Calculate loss using cross-entropy with sum reduction
-        loss = F.cross_entropy(logits_flat, labels_flat, reduction="sum", ignore_index=-100)
-        
-        # Increment usage counter
-        if hasattr(weight, 'count'):
-            weight.count += 1
-        else:
-            weight.count = 1
-        
-        # Save for backward
-        ctx.save_for_backward(hidden_states, labels, weight)
-        
-        return loss
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        hidden_states, labels, weight = ctx.saved_tensors
-        
-        if hasattr(weight, 'count'):
-            weight.count -= 1
-
-        # Reshape for calculation
-        hidden_states_flat = hidden_states.view(-1, hidden_states.size(-1))
-        labels_flat = labels.view(-1)
-        
-        # Recompute logits
-        logits_flat = F.linear(hidden_states_flat, weight).float()
-        
-        # CORRECTED GRADIENT CALCULATION:
-        # Compute softmax probabilities
-        grad_logits = F.softmax(logits_flat, dim=-1)
-        
-        # Create mask for valid labels (not -100)
-        valid_mask = labels_flat != -100
-        
-        # Subtract 1 from the probability at the correct label position
-        # This implements the derivative: p_i - y_i
-        if valid_mask.any():
-            # Use advanced indexing to subtract 1 at correct positions
-            batch_indices = torch.arange(len(labels_flat), device=labels_flat.device)[valid_mask]
-            label_indices = labels_flat[valid_mask]
-            grad_logits[batch_indices, label_indices] -= 1.0
-        
-        # Scale by the incoming gradient (from the loss)
-        grad_logits = grad_logits * grad_output
-        grad_logits = grad_logits.to(hidden_states.dtype)
-
-        # Gradient for hidden_states
-        grad_hidden_states = (grad_logits @ weight).view_as(hidden_states)
-        
-        # Gradient for weights (accumulated)
-        grad_weight_chunk = grad_logits.T @ hidden_states_flat
-        
-        # Accumulate weight gradients
-        if not hasattr(weight, 'grad') or weight.grad is None:
-            weight.grad = grad_weight_chunk
-        else:
-            weight.grad = weight.grad + grad_weight_chunk
-
-        # Return gradients (only return accumulated weight grad on last chunk)
-        if hasattr(weight, 'count') and weight.count == 0:
-            return grad_hidden_states, None, weight.grad
-        else:
-            return grad_hidden_states, None, None
-'''
-
-#v2
 
 class _LMHeadFunction(torch.autograd.Function):
     """
@@ -271,7 +109,6 @@ class _LMHeadFunction(torch.autograd.Function):
 
         # labels has no gradient
         return grad_hidden, None, grad_weight
-
 
 class LMHeadWrapper(nn.Module):
     """Wrapper for LM head with custom gradient computation"""
@@ -534,6 +371,117 @@ class MiniSequence(nn.Module):
         else:
             raise AttributeError("The underlying model does not have 'prepare_inputs_for_generation'")
 
+#display loss info
+class EnhancedLossLoggingCallback(TrainerCallback):
+    """
+    - Mirrors your true per-token loss into logs["loss_true_mean"] (and optionally overrides logs["loss"])
+    - Ensures learning_rate is present (pulls from optimizer if HF didn't add it)
+    - Keeps/forwards grad_norm if HF added it (safe for FSDP/DeepSpeed)
+    - Optional fallback to compute a local grad norm if HF didn't provide one
+    """
+    def __init__(self, override_console_loss=True, fallback_grad_norm=False):
+        self.override_console_loss = override_console_loss
+        self.fallback_grad_norm = fallback_grad_norm
+        self._last_lr = None
+        self._last_grad_norm = None
+
+    # Grab LR each optimizer step (works for any optimizer / scheduler setup)
+    def on_optimizer_step(self, args, state, control, **kwargs):
+        opt = kwargs.get("optimizer", None)
+        if opt is not None and len(opt.param_groups) > 0:
+            lrs = [pg.get("lr", None) for pg in opt.param_groups if "lr" in pg]
+            try:
+                self._last_lr = float(sum(lrs) / len(lrs))
+            except Exception:
+                self._last_lr = None
+
+    # Optionally compute a *local* grad norm only if HF didn't log one
+    def _compute_local_grad_norm(self, model):
+        try:
+            grads = [p.grad for p in model.parameters() if p.grad is not None]
+            if not grads:
+                return None
+            # NOTE: this is LOCAL norm; with ZeRO-3/FSDP sharding it's not the global norm.
+            stacked = torch.stack([g.detach().data.float().norm(2) for g in grads])
+            return float(stacked.norm(2).item())
+        except Exception:
+            return None
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs:
+            return
+
+        # 1) True per-token loss from your Trainer.compute_loss
+        if "loss_mean_dbg" in logs:
+            logs["loss_true_mean"] = logs["loss_mean_dbg"]
+            if self.override_console_loss:
+                logs["loss"] = logs["loss_mean_dbg"]  # makes console show the real mean
+
+        # 2) Learning rate
+        if "learning_rate" not in logs and self._last_lr is not None:
+            logs["learning_rate"] = self._last_lr
+
+        # 3) Grad norm
+        if "grad_norm" in logs:
+            self._last_grad_norm = logs["grad_norm"]  # forward the one HF computed (global, clip-aware)
+        else:
+            # Optional fallback (local only; not recommended with ZeRO-3/FSDP)
+            if self.fallback_grad_norm and "model" in kwargs and kwargs["model"] is not None:
+                gn = self._compute_local_grad_norm(kwargs["model"])
+                if gn is not None:
+                    logs["grad_norm"] = gn
+                    self._last_grad_norm = gn
+            elif self._last_grad_norm is not None:
+                # carry forward the last seen value so dashboards stay continuous
+                logs["grad_norm"] = self._last_grad_norm
+
+#display grad_norm info
+class ClipAuditCallback(TrainerCallback):
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs:
+            return
+        # Add max_grad_norm so it's visible
+        if getattr(args, "max_grad_norm", None) is not None:
+            logs["max_grad_norm"] = float(args.max_grad_norm)
+
+        # If HF/Accelerate provided grad_norm (pre-clip), derive clip info
+        gn = logs.get("grad_norm", None)
+        mg = getattr(args, "max_grad_norm", None)
+        if gn is not None and mg is not None and mg > 0:
+            clipped = gn > mg
+            logs["grad_clipped"] = bool(clipped)
+            # factor applied to grads to satisfy the threshold (1.0 means no clipping)
+            logs["grad_clip_factor"] = float(min(1.0, mg / max(gn, 1e-12)))
+
+        # If you also log the true per-token loss elsewhere, keep it:
+        if "loss_mean_dbg" in logs:
+            logs["loss_true_mean"] = logs["loss_mean_dbg"]
+            logs["loss"] = logs["loss_mean_dbg"]  # optional: make console show true mean
+
+#use modified trainer 
+class MST_Trainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        outputs = model(**inputs)
+        summed_loss = outputs.loss
+        num_tokens = outputs.num_tokens
+        if not torch.is_tensor(num_tokens):
+            num_tokens = torch.tensor(num_tokens, device=summed_loss.device, dtype=summed_loss.dtype)
+        else:
+            num_tokens = num_tokens.to(device=summed_loss.device, dtype=summed_loss.dtype).clamp(min=1)
+
+        mean_loss = summed_loss / num_tokens
+
+        # one-line scalar logs (HF Trainer will pick these up)
+        if hasattr(self, "log"):
+            self.log({
+                "loss_mean_dbg": mean_loss.detach().float().item(),
+                "loss_sum_dbg":  summed_loss.detach().float().item(),
+                "num_tokens_dbg": num_tokens.detach().float().item(),
+            })
+
+        return (mean_loss, outputs) if return_outputs else mean_loss
+
+
 
 # Usage example:
 """
@@ -560,4 +508,11 @@ loss.backward()
 
 # Generation
 generated = wrapped_model.generate(**inputs, max_new_tokens=50)
+
+
+
+
+
+
+
 """
